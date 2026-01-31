@@ -126,8 +126,7 @@ def process_frame(slot_results, product_results, validator):
         # 4. Update the validator for EVERY slot, every frame
         # This prevents the history from "freezing"
         decision = validator.update(slot_id, assigned_product)
-        if decision is not None:
-            decisions[slot_id] = decision
+        decisions[slot_id] = decision
             
     return decisions
 
@@ -213,4 +212,5 @@ while cap.isOpened():
 
 cap.release()
 cv2.destroyAllWindows()
+
 
