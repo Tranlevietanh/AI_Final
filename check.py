@@ -6,7 +6,13 @@ from ultralytics import YOLO
 
 # ================= CONFIG =================
 
-STABILITY_TIME = 5.0  # seconds
+CAMERA_FPS = 15
+SAMPLE_FPS = 3
+STABILITY_TIME = 5.0
+NUM_SLOTS = 10
+
+FRAME_STRIDE = CAMERA_FPS // SAMPLE_FPS   
+REQUIRED_SAMPLES = SAMPLE_FPS * int(STABILITY_TIME)
 
 # Expected product per slot (by class ID)
 EXPECTED_MAPPING = {
@@ -23,7 +29,7 @@ EXPECTED_MAPPING = {
 }
 
 # ================= HELPERS =================
-
+slot_states = {slot_id: None for slot_id in range(NUM_SLOTS)}
 def intersection_area(boxA, boxB):
     xA = max(boxA[0], boxB[0])
     yA = max(boxA[1], boxB[1])
@@ -45,47 +51,43 @@ def product_inside_slot(product_box, slot_box, thresh=0.7):
 # ================= TEMPORAL SLOT TRACKER =================
 
 class SlotTemporalValidator:
-    def __init__(self, expected_mapping, stability_time, min_samples=5):
+    def __init__(self, expected_mapping, required_samples):
         self.expected_mapping = expected_mapping
-        self.stability_time = stability_time
-        self.min_samples = min_samples
+        self.required_samples = required_samples
         self.history = defaultdict(deque)
-        self.confirmed = {}
 
-    def update(self, slot_id, detected_product, timestamp):
+    def update(self, slot_id, detected_product):
         hist = self.history[slot_id]
-        hist.append((timestamp, detected_product))
+        hist.append(detected_product)
 
-        # Remove old entries
-        while hist and timestamp - hist[0][0] > self.stability_time:
+        # Keep only required samples
+        if len(hist) > self.required_samples:
             hist.popleft()
 
-        products = [p for _, p in hist]
-        if len(products) < self.min_samples:
+        # Not enough evidence yet
+        if len(hist) < self.required_samples:
             return None
 
-        most_common = max(set(products), key=products.count)
+        most_common = max(set(hist), key=hist.count)
 
-        # Majority agreement
-        if products.count(most_common) > len(products) / 2:
+        # Majority vote
+        if hist.count(most_common) > len(hist) / 2:
+            if most_common is None:
+                return None
             expected = self.expected_mapping.get(slot_id)
-            return most_common == expected  # ✅ FIXED
+            return most_common == expected
 
         return None
 # ================= MAIN LOGIC =================
 
 def process_frame(slot_results, product_results, validator):
-    timestamp = time.time()
-
-    # Parse slot detections
-    slots = []
+    # 1. Create a lookup for detected slots
+    # format: {slot_id: bbox}
+    detected_slots_map = {}
     for box, cls in zip(slot_results.boxes.xyxy, slot_results.boxes.cls):
-        slots.append({
-            "slot_id": int(cls),
-            "bbox": box.cpu().numpy()
-        })
+        detected_slots_map[int(cls)] = box.cpu().numpy()
 
-    # Parse product detections
+    # 2. Parse product detections into a list
     products = []
     for box, cls in zip(product_results.boxes.xyxy, product_results.boxes.cls):
         products.append({
@@ -93,44 +95,72 @@ def process_frame(slot_results, product_results, validator):
             "bbox": box.cpu().numpy()
         })
 
-    # Slot → product assignment
-    slot_assignment = {}
+    decisions = {}
 
-    for slot in slots:
-        slot_id = slot["slot_id"]
-        slot_bbox = slot["bbox"]
-
+    # 3. Iterate over ALL possible slot IDs (0-9)
+    for slot_id in range(NUM_SLOTS):
         assigned_product = None
-        best_coverage = 0.0
+        
+        # Check if the slot model actually found this slot in this frame
+        if slot_id in detected_slots_map:
+            slot_bbox = detected_slots_map[slot_id]
+            best_coverage = 0.0
 
-        for prod in products:
-            inter = intersection_area(prod["bbox"], slot_bbox)
-            coverage = inter / box_area(prod["bbox"])
+            # Find the best product match for THIS slot
+            for prod in products:
+                inter = intersection_area(prod["bbox"], slot_bbox)
+                coverage = inter / box_area(prod["bbox"])
 
-            if coverage > best_coverage:
-                best_coverage = coverage
-                assigned_product = prod["product_id"]
+                if coverage > best_coverage:
+                    best_coverage = coverage
+                    assigned_product = prod["product_id"]
 
-        if best_coverage < 0.7:
+            # If the product isn't "inside" enough, it's effectively an empty slot
+            if best_coverage < 0.7:
+                assigned_product = None
+        else:
+            # The slot model didn't even see the slot (occlusion/blur)
+            # We pass None to validator to record a "missing" state
             assigned_product = None
 
-        slot_assignment[slot_id] = assigned_product
-
-    # Temporal validation
-    decisions = {}
-    confirmed_slots = set()
-
-    for slot_id, product_id in slot_assignment.items():
-        if product_id is None:
-            continue
-
-        decision = validator.update(slot_id, product_id, timestamp)
+        # 4. Update the validator for EVERY slot, every frame
+        # This prevents the history from "freezing"
+        decision = validator.update(slot_id, assigned_product)
         if decision is not None:
             decisions[slot_id] = decision
-            confirmed_slots.add(slot_id)
-            validator.history[slot_id].clear()
+            
     return decisions
 
+
+def draw_text_only(frame, slot_states):
+    start_x = 20
+    start_y = 40
+    line_h = 30
+
+    for slot_id in range(10):
+        state = slot_states.get(slot_id)
+
+        if state is None:
+            text = f"Slot {slot_id}: CHECKING"
+            color = (255, 255, 0)  # yellow
+        elif state is True:
+            text = f"Slot {slot_id}: OK"
+            color = (0, 255, 0)
+        else:
+            text = f"Slot {slot_id}: NG"
+            color = (0, 0, 255)
+
+        y = start_y + slot_id * line_h
+
+        cv2.putText(
+            frame,
+            text,
+            (start_x, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            color,
+            2
+        )
 def draw_results(frame, slot_results, decisions):
     for box, cls in zip(slot_results.boxes.xyxy, slot_results.boxes.cls):
         slot_id = int(cls)
@@ -153,22 +183,29 @@ def draw_results(frame, slot_results, decisions):
 slot_model = YOLO(r"C:\Users\VBK computer\Downloads\slot_mosaic.pt")
 product_model = YOLO(r"C:\Users\VBK computer\Downloads\product.pt")
 
-validator = SlotTemporalValidator(EXPECTED_MAPPING, STABILITY_TIME)
+validator = SlotTemporalValidator(EXPECTED_MAPPING, REQUIRED_SAMPLES)
 
-cap = cv2.VideoCapture(r"C:\Users\VBK computer\Downloads\lower_full_2.mp4")
+cap = cv2.VideoCapture(r"C:\Users\VBK computer\Downloads\camera_0_1764404594.mp4")
 
+frame_idx = 0
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
         break
 
+    frame_idx += 1
+
+    if frame_idx % FRAME_STRIDE != 0:
+        continue
     slot_results = slot_model(frame, conf=0.5)[0]
     product_results = product_model(frame, conf=0.5)[0]
 
     decisions = process_frame(slot_results, product_results, validator)
-
+    for slot_id, ok in decisions.items():
+        slot_states[slot_id] = ok
     # ---- DRAW RESULTS ----
-    draw_results(frame, slot_results, decisions)
+    draw_text_only(frame, slot_states)
+    draw_results (frame, slot_results, decisions)
 
     cv2.imshow("Slot Inspection", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):  
