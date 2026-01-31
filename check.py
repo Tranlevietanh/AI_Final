@@ -166,17 +166,34 @@ def draw_results(frame, slot_results, decisions):
         x1, y1, x2, y2 = map(int, box.cpu().numpy())
 
         if slot_id in decisions:
-            ok = decisions[slot_id]
-            color = (0, 255, 0) if ok else (0, 0, 255)
-            label = f"Slot {slot_id}: {'OK' if ok else 'NG'}"
+            state = decisions[slot_id]
+
+            if state is True:
+                color = (0, 255, 0)
+                label = f"Slot {slot_id}: OK"
+
+            elif state is False:
+                color = (0, 0, 255)
+                label = f"Slot {slot_id}: NG"
+
+            else:  # state is None
+                color = (255, 255, 0)
+                label = f"Slot {slot_id}: CHECKING"
+
         else:
+            # Slot not evaluated this frame
             color = (255, 255, 0)
-            label = f"Slot {slot_id}: checking"
+            label = f"Slot {slot_id}: CHECKING"
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         cv2.putText(
-            frame, label, (x1, y1 - 10),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2
+            frame,
+            label,
+            (x1, y1 - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            color,
+            2
         )
 
 slot_model = YOLO(r"C:\Users\VBK computer\Downloads\slot_mosaic.pt")
@@ -184,7 +201,7 @@ product_model = YOLO(r"C:\Users\VBK computer\Downloads\product.pt")
 
 validator = SlotTemporalValidator(EXPECTED_MAPPING, REQUIRED_SAMPLES)
 
-cap = cv2.VideoCapture(r"C:\Users\VBK computer\Downloads\camera_0_1764404594.mp4")
+cap = cv2.VideoCapture(r"C:\Users\VBK computer\Downloads\upper_full_1.mp4")
 
 frame_idx = 0
 while cap.isOpened():
@@ -209,8 +226,8 @@ while cap.isOpened():
     cv2.imshow("Slot Inspection", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):  
         break
-
+    
+    
 cap.release()
 cv2.destroyAllWindows()
-
 
