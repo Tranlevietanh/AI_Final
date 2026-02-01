@@ -15,8 +15,16 @@ NUM_SLOTS = 10
 INFER_INTERVAL = 1.0 / SAMPLE_FPS
 last_infer_time = 0.0
 
+STATE_TO_CAMERA = {
+    0: 0,  # camera 0 checks state 0 -> 1
+    1: 1,  # camera 1 checks state 1 -> 2
+    2: 2,  # camera 2 checks state 2 -> 3
+    3: 3,  # camera 3 checks state 3 -> 4
+}
+
 CAMERA_URLS = [
     "rtsp://admin:BWKUYM@192.168.1.144:554/ch1/main"
+
 ]
 
 REQUIRED_SAMPLES = SAMPLE_FPS * int(STABILITY_TIME)
@@ -36,7 +44,11 @@ EXPECTED_MAPPING = {
 }
 
 # ================= HELPERS =================
-slot_states = {slot_id: None for slot_id in range(NUM_SLOTS)}
+slot_states_per_camera = {
+    cam_id: {slot_id: None for slot_id in range(NUM_SLOTS)}
+    for cam_id in range(len(CAMERA_URLS))
+}
+
 def intersection_area(boxA, boxB):
     xA = max(boxA[0], boxB[0])
     yA = max(boxA[1], boxB[1])
@@ -86,6 +98,10 @@ class SlotTemporalValidator:
 
         return None
 # ================= MAIN LOGIC =================
+validators = {
+    cam_id: SlotTemporalValidator(EXPECTED_MAPPING, REQUIRED_SAMPLES)
+    for cam_id in range(len(CAMERA_URLS))
+}
 
 def process_frame(slot_results, product_results, validator):
     # 1. Create a lookup for detected slots
@@ -207,8 +223,6 @@ slot_model = YOLO(r"C:\Users\VBK computer\Downloads\slot.pt")
 product_model = YOLO(r"C:\Users\VBK computer\Downloads\product.pt")
 
 
-validator = SlotTemporalValidator(EXPECTED_MAPPING, REQUIRED_SAMPLES)
-
 # State controller (locks per-state once processed)
 state_controller = StateController(initial_state=0)
 
@@ -221,67 +235,68 @@ reader.start()
 #     ret, frame = cap.read()
 #     if not ret:
 #         break
+latest_slot_results = {}
+latest_decisions = {}
 
 try:
     while True:
+        latest_advanced = False
         frames = reader.get_frames()
-        frame = frames[0]
-
-        if frame is None:
-            time.sleep(0.005)
-            continue
-
-        frame = cv2.resize(frame, None, fx=0.5, fy=0.5)
         now = time.time()
 
-        # ================= INFERENCE (3 FPS) =================
-        if now - last_infer_time >= INFER_INTERVAL:
-            last_infer_time = now
-            slot_results = slot_model(frame, conf=0.5)[0]
-            product_results = product_model(frame, conf=0.5)[0]
+        current_state = state_controller.state
+        active_cam = STATE_TO_CAMERA.get(current_state)
 
-            decisions = process_frame(slot_results, product_results, validator)
+        if active_cam is not None: 
+            frame = frames[active_cam]
 
-            for slot_id, ok in decisions.items():
-                slot_states[slot_id] = ok
+            # ---------- INFERENCE (ONE CAMERA, LOW FPS) ----------
+            if frame is not None and now - last_infer_time >= INFER_INTERVAL:
+                last_infer_time = now
+                frame_small = cv2.resize(frame, None, fx=0.5, fy=0.5)
 
-            current_state, advanced, new_state = process_from_slot_states(
-                state_controller,
-                slot_states
+                slot_results = slot_model(frame_small, conf=0.5)[0]
+                product_results = product_model(frame_small, conf=0.5)[0]
+
+                decisions = process_frame(
+                    slot_results,
+                    product_results,
+                    validators[active_cam]
+                )
+
+                slot_states_per_camera[active_cam].update(decisions)
+                latest_slot_results[active_cam] = slot_results
+                latest_decisions[active_cam] = decisions
+
+                # ---------- STATE ADVANCE (ONLY ACTIVE CAMERA) ----------
+
+                latest_advanced = False
+                if active_cam is not None:
+                    _, latest_advanced, _ = process_from_slot_states(
+                        state_controller,
+                        slot_states_per_camera[active_cam]
+                    )
+
+                    if latest_advanced:
+                        validators[active_cam].history.clear()
+
+        slot_results = latest_slot_results.get(active_cam)
+        if frame is not None and slot_results is not None:
+            frame_small = cv2.resize(frame, None, fx = 0.5, fy = 0.5)
+            draw_results(
+                frame_small,
+                latest_slot_results.get(active_cam),
+                latest_decisions.get(active_cam, {})
             )
 
-            if advanced:
-                for dq in validator.history.values():
-                    dq.clear()
+            draw_text_only(frame_small, slot_states_per_camera[active_cam])
 
-            latest_slot_results = slot_results
-            latest_decisions = decisions
-            latest_advanced = advanced
+            status_text = f"State:{state_controller.state} | {'Accepted' if latest_advanced else 'Waiting'}"
+            cv2.putText(frame_small, status_text, (20, frame.shape[0] - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
 
-        # ================= DRAW (EVERY FRAME) =================
-        if latest_slot_results is not None:
-            draw_results(frame, latest_slot_results, latest_decisions)
+            cv2.imshow("Slot Inspection", frame_small)
 
-        draw_text_only(frame, slot_states)
-
-        # Draw state info
-        status_text = f"State:{state_controller.state} | {'Accepted' if latest_advanced else 'Waiting'}"
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        scale = 0.7
-        thickness = 2
-        (text_w, text_h), baseline = cv2.getTextSize(status_text, font, scale, thickness)
-        h, w = frame.shape[:2]
-        cv2.putText(
-            frame,
-            status_text,
-            (w - text_w - 10, h - 10),
-            font,
-            scale,
-            (255, 255, 255),
-            thickness
-        )
-
-        cv2.imshow("Slot Inspection", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 finally:
