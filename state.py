@@ -6,7 +6,7 @@ EXPECTED_MAPPING = {
 	0: 0, 1: 0, 2: 0,
 	3: 1, 4: 2, 5: 6,
 	6: 7, 7: 3, 8: 4, 9: 5,
-}
+} #mapping giữa object và slot
 
 # State -> slot requirements to advance
 CAMERA_REQUIREMENTS = {
@@ -14,7 +14,7 @@ CAMERA_REQUIREMENTS = {
 	1: {3: 1, 4: 2},               # state 1 -> state 2
 	2: {7: 3, 8: 4, 9: 5},         # state 2 -> state 3
 	3: {5: 6, 6: 7},               # state 3 -> state 4 (final)
-}
+} #mapping giữa state và slot
 
 
 class StateController:
@@ -37,7 +37,7 @@ class StateController:
 			if not slot_decisions.get(slot_id, False):
 				return False, None
 
-		# All OK -> advance state
+		# All OK -> advance state. Chỉ + 1 state, không thể nhảy vọt
 		self.state += 1
 		return True, self.state
 

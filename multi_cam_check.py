@@ -7,12 +7,10 @@ from state import StateController, process_from_slot_states
 from cam_view import CameraReader
 
 
-# ================= CONFIG =================
-
-SAMPLE_FPS = 5
-STABILITY_TIME = 5.0
+SAMPLE_FPS = 5 #FPS mỗi lần chạy mô hình YOLO
+STABILITY_TIME = 5.0 #Độ dài queue để xét liệu object có thực sự nằm trong slot
 NUM_SLOTS = 10
-INFER_INTERVAL = 1.0 / SAMPLE_FPS
+INFER_INTERVAL = 1.0 / SAMPLE_FPS #Thời gian giữa mỗi lần chạy YOLO
 last_infer_time = 0.0
 
 STATE_TO_CAMERA = {
@@ -20,16 +18,16 @@ STATE_TO_CAMERA = {
     1: 1,  # camera 1 checks state 1 -> 2
     2: 2,  # camera 2 checks state 2 -> 3
     3: 3,  # camera 3 checks state 3 -> 4
-}
+} #mapping giữa vị trí camera và state
 
 CAMERA_URLS = [
     "rtsp://admin:CPSFLT@192.168.1.160:554/ch1/main",
     "rtsp://admin:DVCLRQ@192.168.1.116:554/ch1/main",
     "rtsp://admin:BWKUYM@192.168.1.144:554/ch1/main",
     "rtsp://admin:KXILGD@192.168.1.152:554/ch1/main"
-]
+] #địa chỉ camera
 
-REQUIRED_SAMPLES = SAMPLE_FPS * int(STABILITY_TIME)
+REQUIRED_SAMPLES = SAMPLE_FPS * int(STABILITY_TIME) #Số lượng mẫu (frame) trong queue xét obj có thực sự trong slot (5*5=25)
 
 # Expected product per slot (by class ID)
 EXPECTED_MAPPING = {
@@ -43,13 +41,12 @@ EXPECTED_MAPPING = {
     7: 3,
     8: 4,
     9: 5
-}
+} #mapping giữa slot và object
 
-# ================= HELPERS =================
 slot_states_per_camera = {
     cam_id: {slot_id: None for slot_id in range(NUM_SLOTS)}
     for cam_id in range(len(CAMERA_URLS))
-}
+} #State của các slot theo camera
 
 def intersection_area(boxA, boxB):
     xA = max(boxA[0], boxB[0])
@@ -60,78 +57,72 @@ def intersection_area(boxA, boxB):
     if xA >= xB or yA >= yB:
         return 0.0
 
-    return (xB - xA) * (yB - yA)
+    return (xB - xA) * (yB - yA) #Hàm tính diện tích giao giữa box của object và box của slot
 
 def box_area(box):
-    return (box[2] - box[0]) * (box[3] - box[1])
+    return (box[2] - box[0]) * (box[3] - box[1]) #Hàm tính diện tích của box 
 
 def product_inside_slot(product_box, slot_box, thresh=0.7):
     inter = intersection_area(product_box, slot_box)
-    return inter / box_area(product_box) >= thresh
+    return inter / box_area(product_box) >= thresh #Object được tính là trong slot trong 1 frame khi diện tích intersection >= 0.7 diện tích box
 
-# ================= TEMPORAL SLOT TRACKER =================
 
 class SlotTemporalValidator:
     def __init__(self, expected_mapping, required_samples):
         self.expected_mapping = expected_mapping
         self.required_samples = required_samples
-        self.history = defaultdict(deque)
+        self.history = defaultdict(deque) #khai báo mapping giữa object và slot, số sample của queue, queue
 
     def update(self, slot_id, detected_product):
         hist = self.history[slot_id]
-        hist.append(detected_product)
+        hist.append(detected_product)  #Thêm vào queue mỗi lượt detect (1 frame)
 
         # Keep only required samples
         if len(hist) > self.required_samples:
-            hist.popleft()
+            hist.popleft() #Khi queue quá số mẫu (25) sẽ pop mẫu cũ nhất
 
         # Not enough evidence yet
         if len(hist) < self.required_samples:
-            return None
+            return None #Khi queue chưa đủ số mẫu (25) chưa đưa ra quyết định là obj có thật sự nằm trong slot không
 
-        most_common = max(set(hist), key=hist.count)
+        most_common = max(set(hist), key=hist.count) #lấy kết quả phổ biến nhất trong queue
 
         # Majority vote
-        if hist.count(most_common) > len(hist) / 2:
+        if hist.count(most_common) > len(hist) / 2: #nếu kết quả phổ biến nhất chiếm hơn 50% queue
             if most_common is None:
-                return None
+                return None #trường hợp không có object
             expected = self.expected_mapping.get(slot_id)
-            return most_common == expected
+            return most_common == expected #trường hợp có object -> So sánh với mapping: Trả về True/False
 
         return None
-# ================= MAIN LOGIC =================
+
 validators = {
     cam_id: SlotTemporalValidator(EXPECTED_MAPPING, REQUIRED_SAMPLES)
     for cam_id in range(len(CAMERA_URLS))
-}
+} #Các class kiểm tra cho các cam
 
 def process_frame(slot_results, product_results, validator):
-    # 1. Create a lookup for detected slots
-    # format: {slot_id: bbox}
+
     detected_slots_map = {}
     for box, cls in zip(slot_results.boxes.xyxy, slot_results.boxes.cls):
-        detected_slots_map[int(cls)] = box.cpu().numpy()
+        detected_slots_map[int(cls)] = box.cpu().numpy() #Trả lại kết quả box của slot theo cls
 
-    # 2. Parse product detections into a list
     products = []
     for box, cls in zip(product_results.boxes.xyxy, product_results.boxes.cls):
         products.append({
             "product_id": int(cls),
             "bbox": box.cpu().numpy()
-        })
+        }) #Trả lại kết quả box của product theo cls
 
     decisions = {}
 
-    # 3. Iterate over ALL possible slot IDs (0-9)
     for slot_id in range(NUM_SLOTS):
         assigned_product = None
-        
-        # Check if the slot model actually found this slot in this frame
+
         if slot_id in detected_slots_map:
             slot_bbox = detected_slots_map[slot_id]
             best_coverage = 0.0
 
-            # Find the best product match for THIS slot
             for prod in products:
                 inter = intersection_area(prod["bbox"], slot_bbox)
                 coverage = inter / box_area(prod["bbox"])
@@ -140,18 +131,13 @@ def process_frame(slot_results, product_results, validator):
                     best_coverage = coverage
                     assigned_product = prod["product_id"]
 
-            # If the product isn't "inside" enough, it's effectively an empty slot
             if best_coverage < 0.7:
                 assigned_product = None
         else:
-            # The slot model didn't even see the slot (occlusion/blur)
-            # We pass None to validator to record a "missing" state
             assigned_product = None
 
-        # 4. Update the validator for EVERY slot, every frame
-        # This prevents the history from "freezing"
-        decision = validator.update(slot_id, assigned_product)
-        decisions[slot_id] = decision
+        decision = validator.update(slot_id, assigned_product) #update queue kiểm tra xem object có thực sự trong slot không
+        decisions[slot_id] = decision #viết vào một list theo slot_id
             
     return decisions
 
@@ -184,7 +170,7 @@ def draw_text_only(frame, slot_states):
             0.7,
             color,
             2
-        )
+        ) #viết state của các slot trên màn hình 
 def draw_results(frame, slot_results, decisions):
     for box, cls in zip(slot_results.boxes.xyxy, slot_results.boxes.cls):
         slot_id = int(cls)
@@ -219,18 +205,17 @@ def draw_results(frame, slot_results, decisions):
             0.6,
             color,
             2
-        )
+        ) #viết quyết định của các slot theo từng frame
 
 slot_model = YOLO(r"C:\Users\VBK computer\Downloads\slot.pt")
-product_model = YOLO(r"C:\Users\VBK computer\Downloads\product.pt")
+product_model = YOLO(r"C:\Users\VBK computer\Downloads\product.pt") #nạp mô hình
 
 
 # State controller (locks per-state once processed)
-state_controller = StateController(initial_state=0)
+state_controller = StateController(initial_state=0) #khai báo class quản lý trạng thái
 
-# video source (can be replaced by CLI arg later)
 # cap = cv2.VideoCapture(r"D:\projects\ai&app\cky\AI_Final\camera_0_1764404513.mp4")
-reader = CameraReader(CAMERA_URLS, width=1280, height=720)
+reader = CameraReader(CAMERA_URLS, width=1280, height=720) #khai báo class lấy dữ liệu từ cam
 reader.start()
 
 # while cap.isOpened():
@@ -243,30 +228,30 @@ latest_decisions = {}
 try:
     while True:
         latest_advanced = False
-        frames = reader.get_frames()
+        frames = reader.get_frames() #lấy frame từ cam. frames là một list gồm 4 vị trí frames[0], [1],.. tương ứng với 4 cam
         now = time.time()
 
-        current_state = state_controller.state
-        active_cam = STATE_TO_CAMERA.get(current_state)
+        current_state = state_controller.state #state hiện tại (0, 1, 2, 3, 4)
+        active_cam = STATE_TO_CAMERA.get(current_state) #Cam tương ứng với state
 
         if active_cam is not None: 
-            frame = frames[active_cam]
+            frame = frames[active_cam] #Lấy frame của cam tương ứng với state
 
             # ---------- INFERENCE (ONE CAMERA, LOW FPS) ----------
-            if frame is not None and now - last_infer_time >= INFER_INTERVAL:
+            if frame is not None and now - last_infer_time >= INFER_INTERVAL: #nếu đã đủ thời gian ngắt quãng giữa các thời gian xử lý, tiếp tục xử lý
                 last_infer_time = now
-                frame_small = cv2.resize(frame, None, fx=0.5, fy=0.5)
+                frame_small = cv2.resize(frame, None, fx=0.5, fy=0.5) #resize từ 1280 về 640
 
-                slot_results = slot_model(frame_small, conf=0.5)[0]
-                product_results = product_model(frame_small, conf=0.5)[0]
+                slot_results = slot_model(frame_small, conf=0.5)[0] #lấy kết quả từ model slot với confidence score = 0.5
+                product_results = product_model(frame_small, conf=0.5)[0] #lấy kết quả từ model object với confidence score = 0.5
 
                 decisions = process_frame(
                     slot_results,
                     product_results,
                     validators[active_cam]
-                )
+                ) #xử lý slot và object -> đưa ra quyết định trong frame này object có trong slot không
 
-                slot_states_per_camera[active_cam].update(decisions)
+                slot_states_per_camera[active_cam].update(decisions) #quyết định này đưa vào trong queue 25 quyết định
                 latest_slot_results[active_cam] = slot_results
                 latest_decisions[active_cam] = decisions
 
@@ -277,10 +262,10 @@ try:
                     _, latest_advanced, _ = process_from_slot_states(
                         state_controller,
                         slot_states_per_camera[active_cam]
-                    )
+                    ) #từ các state của các slot suy luận ra state hiện tại của mô hình: 0, 1, 2 hay 3
 
                     if latest_advanced:
-                        validators[active_cam].history.clear()
+                        validators[active_cam].history.clear() #khi chuyển state -> chuyển cam, và xóa lịch sử queue của các slot để xử lý thông tin mới
 
         slot_results = latest_slot_results.get(active_cam)
         if frame is not None and slot_results is not None:
@@ -289,13 +274,13 @@ try:
                 frame_small,
                 latest_slot_results.get(active_cam),
                 latest_decisions.get(active_cam, {})
-            )
+            ) #viết ra màn hình
 
-            draw_text_only(frame_small, slot_states_per_camera[active_cam])
+            draw_text_only(frame_small, slot_states_per_camera[active_cam]) #viết ra màn hình
 
             status_text = f"State:{state_controller.state} | {'Accepted' if latest_advanced else 'Waiting'}"
             cv2.putText(frame_small, status_text, (20, frame_small.shape[0] - 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2) #viết ra màn hình 
 
             cv2.imshow("Slot Inspection", frame_small)
 
