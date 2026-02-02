@@ -23,8 +23,10 @@ STATE_TO_CAMERA = {
 }
 
 CAMERA_URLS = [
-    "rtsp://admin:BWKUYM@192.168.1.144:554/ch1/main"
-
+    "rtsp://admin:CPSFLT@192.168.1.160:554/ch1/main",
+    "rtsp://admin:DVCLRQ@192.168.1.116:554/ch1/main",
+    "rtsp://admin:BWKUYM@192.168.1.144:554/ch1/main",
+    "rtsp://admin:KXILGD@192.168.1.152:554/ch1/main"
 ]
 
 REQUIRED_SAMPLES = SAMPLE_FPS * int(STABILITY_TIME)
@@ -292,7 +294,7 @@ try:
             draw_text_only(frame_small, slot_states_per_camera[active_cam])
 
             status_text = f"State:{state_controller.state} | {'Accepted' if latest_advanced else 'Waiting'}"
-            cv2.putText(frame_small, status_text, (20, frame.shape[0] - 20),
+            cv2.putText(frame_small, status_text, (20, frame_small.shape[0] - 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
 
             cv2.imshow("Slot Inspection", frame_small)
